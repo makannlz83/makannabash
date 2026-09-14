@@ -1,3 +1,5 @@
+using System;
+
 namespace AetherVPN.Models;
 
 public enum ConnectionState
