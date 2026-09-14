@@ -1,0 +1,155 @@
+name: Build AetherVPN
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build AetherVPN for Windows x86_64
+    runs-on: windows-latest
+    
+    steps:
+      # ── 1. Checkout this repository ──
+      - name: Checkout AetherVPN
+        uses: actions/checkout@v4
+        with:
+          path: aethervpn
+
+      # ── 2. Clone Aether core (with quiche) ──
+      - name: Clone Aether Core
+        run: |
+          git clone https://github.com/CluvexStudio/Aether.git aether-core
+        shell: bash
+
+      # ── 3. Install Rust toolchain ──
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      # ── 4. Install build dependencies ──
+      - name: Install CMake and Ninja
+        uses: lukka/get-cmake@latest
+
+      - name: Install NASM
+        uses: ilammy/setup-nasm@v1
+
+      - name: Install Go (for pluggable transports)
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      # ── 5. Install .NET 8 SDK ──
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      # ── 6. Build Aether core binary ──
+      - name: Build Aether Core (aether.exe)
+        working-directory: aether-core/aether
+        run: cargo build --release --target x86_64-pc-windows-msvc
+        env:
+          CARGO_TERM_COLOR: always
+
+      # ── 7. Build pluggable transports (for Tor support) ──
+      - name: Build Pluggable Transports
+        working-directory: aether-core/aether
+        shell: bash
+        run: |
+          if [ -f "../pt-build.sh" ]; then
+            bash ../pt-build.sh windows amd64 "$PWD/pt" || echo "PT build skipped (optional)"
+          else
+            echo "No pt-build.sh found, skipping pluggable transports"
+            mkdir -p pt
+          fi
+
+      # ── 8. Build AetherVPN GUI ──
+      - name: Restore NuGet packages
+        working-directory: aethervpn/src/AetherVPN
+        run: dotnet restore
+
+      - name: Build AetherVPN GUI
+        working-directory: aethervpn/src/AetherVPN
+        run: |
+          dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish
+
+      # ── 9. Package everything together ──
+      - name: Package AetherVPN
+        shell: pwsh
+        run: |
+          $outDir = "AetherVPN-windows-x86_64"
+          New-Item -ItemType Directory -Force -Path $outDir
+
+          # Copy GUI
+          Copy-Item "aethervpn/src/AetherVPN/publish/AetherVPN.exe" $outDir/
+
+          # Copy Aether core
+          Copy-Item "aether-core/aether/target/x86_64-pc-windows-msvc/release/aether.exe" $outDir/
+
+          # Copy pluggable transports if they exist
+          if (Test-Path "aether-core/aether/pt") {
+            Copy-Item -Recurse "aether-core/aether/pt" "$outDir/pt"
+          }
+
+          # Create run-aether.bat for standalone core usage
+          @"
+          @echo off
+          echo Starting Aether Core...
+          echo Press Ctrl+C to stop.
+          echo.
+          aether.exe %*
+          echo.
+          echo Aether has stopped.
+          pause
+          "@ | Set-Content "$outDir/run-aether.bat"
+
+          # Create README
+          @"
+          # AetherVPN
+          
+          Windows VPN client powered by Aether Core.
+          
+          ## Quick Start
+          1. Run AetherVPN.exe
+          2. Select your preferred protocol (MASQUE recommended)
+          3. Click Connect
+          4. Wait for endpoint scanning and tunnel establishment
+          5. Your SOCKS5 proxy will be available at 127.0.0.1:1819
+          
+          ## Files
+          - AetherVPN.exe  - GUI application
+          - aether.exe     - Aether core engine
+          - pt/            - Pluggable transports (for Tor)
+          - run-aether.bat - Run aether.exe standalone (without GUI)
+          
+          ## Powered by
+          Aether Core: https://github.com/CluvexStudio/Aether
+          "@ | Set-Content "$outDir/README.txt"
+
+          # Create ZIP
+          Compress-Archive -Path "$outDir/*" -DestinationPath "AetherVPN-windows-x86_64.zip"
+
+      # ── 10. Upload artifact ──
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AetherVPN-windows-x86_64
+          path: AetherVPN-windows-x86_64.zip
+          if-no-files-found: error
+
+      # ── 11. Create GitHub Release (only on tag push) ──
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: AetherVPN-windows-x86_64.zip
+          generate_release_notes: true
+          draft: false
+          prerelease: false
